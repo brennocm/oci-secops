@@ -1,0 +1,16 @@
+# Secrets — copie .env.example para .env e preencha antes do deploy
+.env
+.env.*
+!.env.example
+
+# Logs de provisionamento (contêm IPs e IDs de instâncias reais)
+provisioned_vps.log
+*.log
+
+# Arquivos de rascunho e notas locais
+add.txt
+plan.md
+ci-security-setup.md
+.claudeinfo.txt
+info.txt
+.claude
