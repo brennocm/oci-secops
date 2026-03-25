@@ -11,11 +11,11 @@ Conjunto de scripts para provisionar, auditar e gerenciar instâncias na **Oracl
 O orquestrador pode provisionar o limite *Always Free* em diferentes topologias:
 
 | Opção | Topologia | Recursos | Uso Ideal |
-|-------|-----------|----------|-----------|
-| 1 | Instância Única Potente | 4 OCPU / 24GB RAM | Automações pesadas, força bruta |
-| 2 | Par Balanceado | 2× (2 OCPU / 12GB RAM) | Divisão de escopos de scan |
-| 3 | Cluster Pequeno | 4× (1 OCPU / 6GB RAM) | Arquitetura mestre/nó, evasão de bloqueios IP |
-| 4 | Instância Simples | 1 OCPU / 6GB RAM | Testes rápidos e isolados |
+|--------|----------|-----------|-----------|
+| 1 | Full Power | 4 OCPU / 24GB RAM | Automações pesadas, força bruta |
+| 2 | Balanced Pair | 2× (2 OCPU / 12GB RAM) | Divisão de escopos de scan |
+| 3 | Small Cluster | 4× (1 OCPU / 6GB RAM) | Arquitetura mestre/nó, evasão de bloqueios IP |
+| 4 | Single Instance | 1 OCPU / 6GB RAM | Testes rápidos e isolados |
 | 5 | CI Security | 4 OCPU / 24GB RAM | Pipeline SAST/DAST/SCA completo |
 
 ---
