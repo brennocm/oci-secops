@@ -1,7 +1,7 @@
 #!/bin/bash
 export LANG=C.UTF-8
-# setup_ci.sh - Instalador de ferramentas CI pós-boot
-# (Opção 5 em oci_provision.sh — executado após o cloud-init)
+# setup_ci.sh - CI tools installer, runs post-boot
+# (Option 5 in oci_provision.sh — executed after cloud-init)
 
 set -e
 
@@ -10,25 +10,25 @@ if ! systemctl is-active --quiet docker; then
     timeout 60 bash -c 'until systemctl is-active --quiet docker; do sleep 3; done'
 fi
 
-# --- 1b. QEMU (emulação AMD64 em ARM para imagens x86 como owasp/dependency-check) ---
+# --- 1b. QEMU (AMD64 emulation on ARM for x86 images such as owasp/dependency-check) ---
 echo "[*] Instalando qemu-user-static para emulação AMD64..."
 apt-get install -y qemu-user-static >/dev/null 2>&1
 docker run --rm --privileged multiarch/qemu-user-static --reset -p yes >/dev/null 2>&1
 echo "[+] Emulação AMD64 habilitada."
 
-# --- 2. CRIAR ESTRUTURA DE DIRETÓRIOS ---
+# --- 2. CREATE DIRECTORY STRUCTURE ---
 echo "[*] Criando estrutura /opt/ci-security..."
 mkdir -p /opt/ci-security/sonarqube
-mkdir -p /opt/ci-security/dependency-check/data   # cache NVD persistente (~2 GB)
+mkdir -p /opt/ci-security/dependency-check/data   # persistent NVD cache (~2 GB)
 mkdir -p /opt/ci-security/zap/reports
 chown -R ubuntu:ubuntu /opt/ci-security
 
-# --- 2a. NVD API KEY (configuração protegida) ---
+# --- 2a. NVD API KEY (protected configuration) ---
 echo "NVD_API_KEY=${NVD_API_KEY}" > /etc/dep-check.env
 chmod 640 /etc/dep-check.env
 chown root:ubuntu /etc/dep-check.env
 
-# --- 2b. PRÉ-POPULAR O CACHE NVD ---
+# --- 2b. PRE-POPULATE THE NVD CACHE ---
 echo "[*] Baixando cache NVD pré-construído (~111 MB)..."
 NVD_RELEASE="https://github.com/666-member/dont-hurt-her/releases/download/v0.0.1/dep-check-data.tar.gz"
 if wget -q -O /tmp/dep-check-data.tar.gz "$NVD_RELEASE"; then
@@ -40,8 +40,8 @@ else
     echo "[!] Falha ao baixar o cache NVD — a primeira execução do dep-check irá construí-lo automaticamente."
 fi
 
-# --- 3. DOCKER-COMPOSE PARA SONARQUBE + POSTGRES ---
-echo "[*] Gravando Docker Compose para SonarQube..."
+# --- 3. DOCKER COMPOSE FOR SONARQUBE + POSTGRES ---
+echo "[*] Criando arquivo Docker Compose para SonarQube..."
 _SONAR_PASS="${SONAR_DB_PASSWORD}"
 cat > /opt/ci-security/sonarqube/docker-compose.yml << EOF
 services:
@@ -56,7 +56,7 @@ services:
       SONAR_JDBC_USERNAME: sonar
       SONAR_JDBC_PASSWORD: ${_SONAR_PASS}
     ports:
-      - "127.0.0.1:9000:9000"       # somente loopback — tunnel SSH necessário
+      - "127.0.0.1:9000:9000"       # loopback only — SSH tunnel required
     volumes:
       - sonarqube_data:/opt/sonarqube/data
       - sonarqube_extensions:/opt/sonarqube/extensions
@@ -80,7 +80,7 @@ services:
       resources:
         limits:
           memory: 2G
-    # Sem seção ports: — somente rede interna do Docker
+    # No ports section — internal Docker network only
 
 volumes:
   sonarqube_data:
@@ -89,11 +89,11 @@ volumes:
   sonar_db_data:
 EOF
 
-# --- 4. INICIAR SONARQUBE ---
+# --- 4. START SONARQUBE ---
 echo "[*] Iniciando stack do SonarQube..."
 (cd /opt/ci-security/sonarqube && docker compose up -d)
 
-# --- 5. WRAPPER DO DEPENDENCY-CHECK ---
+# --- 5. DEPENDENCY-CHECK WRAPPER ---
 echo "[*] Instalando wrapper dep-check..."
 cat > /usr/local/bin/dep-check << 'WRAPPER'
 #!/bin/bash
@@ -126,7 +126,7 @@ echo "[+] Relatório: $REPORT_DIR/dependency-check-report.html"
 WRAPPER
 chmod +x /usr/local/bin/dep-check
 
-# --- 6. WRAPPERS DO ZAP ---
+# --- 6. ZAP WRAPPERS ---
 echo "[*] Instalando wrappers do ZAP..."
 cat > /usr/local/bin/zap-baseline << 'WRAPPER'
 #!/bin/bash
@@ -171,7 +171,7 @@ echo "[+] Relatório: $REPORT_DIR/zap-api-report.html"
 WRAPPER
 chmod +x /usr/local/bin/zap-api
 
-# --- 7. WRAPPER DO SONAR-SCAN ---
+# --- 7. SONAR-SCAN WRAPPER ---
 echo "[*] Instalando wrapper sonar-scan..."
 cat > /usr/local/bin/sonar-scan << 'WRAPPER'
 #!/bin/bash
@@ -195,7 +195,7 @@ echo "[+] Análise concluída. Dashboard: $SONAR_URL"
 WRAPPER
 chmod +x /usr/local/bin/sonar-scan
 
-# --- 8. PRÉ-BAIXAR IMAGENS DOCKER (paralelo) ---
+# --- 8. PRE-PULL DOCKER IMAGES (parallel) ---
 echo "[*] Baixando imagens das ferramentas em paralelo..."
 docker pull sonarqube:community &
 docker pull postgres:16 &
@@ -206,8 +206,8 @@ docker pull node:current-alpine &
 wait
 echo "[+] Todas as imagens baixadas."
 
-# --- 9. INSTRUÇÕES FINAIS DE ACESSO ---
-echo "[*] Gravando instruções em CI-ACCESS.txt..."
+# --- 9. FINAL ACCESS INSTRUCTIONS ---
+echo "[*] Salvando instruções em CI-ACCESS.txt..."
 cat > /home/ubuntu/CI-ACCESS.txt << EOF
 === Instância CI Security — Instruções de Acesso ===
 

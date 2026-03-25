@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# --- SUPRIMIR AVISOS ---
+# --- SUPPRESS WARNINGS ---
 export SUPPRESS_LABEL_WARNING=True
 
-# --- DEFINIÇÕES DE CORES ---
+# --- COLOR DEFINITIONS ---
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
@@ -37,7 +37,7 @@ echo -e "  ${BOLD}Automated provisioning and hardening of OCI Always Free instan
 echo -e "  ----------------------------------------"
 echo ""
 
-# --- DESCOBERTA DINÂMICA ---
+# --- DYNAMIC DISCOVERY ---
 TENANCY_ID=$(grep "^tenancy=" ~/.oci/config | cut -d'=' -f2)
 if [ -z "$TENANCY_ID" ]; then
     echo -e "${RED}[!] Erro: Tenancy ID não encontrado na configuração.${NC}"
@@ -45,12 +45,12 @@ if [ -z "$TENANCY_ID" ]; then
 fi
 
 echo -e "${YELLOW}[*] Varrendo todos os compartimentos recursivamente...${NC}"
-# Obtém todos os sub-compartimentos e adiciona o tenancy raiz
+# Retrieves all sub-compartments and adds the root tenancy
 SUB_COMPS=$(oci iam compartment list --compartment-id "$TENANCY_ID" --compartment-id-in-subtree true --access-level ACCESSIBLE --output json 2>/dev/null | jq -r '.data[] | select(."lifecycle-state" == "ACTIVE") | .id')
-# Combina e remove IDs duplicados
+# Combine and deduplicate IDs
 ALL_COMPARTMENTS=$(echo "$TENANCY_ID $SUB_COMPS" | tr ' ' '\n' | sort -u)
 
-# Contadores
+# Counters
 TOTAL_BOOT_GB=0
 TOTAL_ARM_OCPU=0
 TOTAL_ARM_RAM=0
@@ -60,23 +60,23 @@ FOUND_IPS=""
 for comp_id in $ALL_COMPARTMENTS; do
     COMP_NAME=$(oci iam compartment get --compartment-id "$comp_id" --output json 2>/dev/null | jq -r '.data.name' || echo "Root")
     
-    # 1. COMPUTAÇÃO
+    # 1. COMPUTE
     INSTANCES_JSON=$(oci compute instance list --compartment-id "$comp_id" --output json 2>/dev/null)
     if [ ! -z "$INSTANCES_JSON" ]; then
-        # Lista instâncias normalmente
+        # List instances normally
         while read -r inst; do
             [ -z "$inst" ] && continue
             FOUND_INSTANCES+="${GREEN}✔${NC} [$COMP_NAME] $inst\n"
         done < <(echo "$INSTANCES_JSON" | jq -r '.data | map(select(."lifecycle-state" != "TERMINATED")) | .[] | "[\(."lifecycle-state")] \(."display-name") | \(."shape") | \(."shape-config".ocpus) OCPU | \(."shape-config"."memory-in-gbs")GB RAM"')
         
-        # SOMA dos recursos ARM Always Free (usando soma direta via JSON para precisão)
+        # SUM of ARM Always Free resources (using direct JSON sum for accuracy)
         DOCPU=$(echo "$INSTANCES_JSON" | jq -r '.data | map(select(."shape" == "VM.Standard.A1.Flex" and ."lifecycle-state" != "TERMINATED")) | [.[]."shape-config".ocpus] | add // 0')
         DRAM=$(echo "$INSTANCES_JSON" | jq -r '.data | map(select(."shape" == "VM.Standard.A1.Flex" and ."lifecycle-state" != "TERMINATED")) | [.[]."shape-config"."memory-in-gbs"] | add // 0')
         TOTAL_ARM_OCPU=$(echo "$TOTAL_ARM_OCPU + $DOCPU" | bc)
         TOTAL_ARM_RAM=$(echo "$TOTAL_ARM_RAM + $DRAM" | bc)
     fi
 
-    # 2. ARMAZENAMENTO (Todos os ADs)
+    # 2. STORAGE (All ADs)
     ADS=$(oci iam availability-domain list --compartment-id "$comp_id" 2>/dev/null | jq -r '.data[].name')
     for ad in $ADS; do
         VOLS_JSON=$(oci bv boot-volume list --availability-domain "$ad" --compartment-id "$comp_id" --output json 2>/dev/null)
@@ -88,21 +88,21 @@ for comp_id in $ALL_COMPARTMENTS; do
         fi
     done
 
-    # 3. REDE (IPs Públicos)
-    # IPs efêmeros via VNICs
+    # 3. NETWORK (Public IPs)
+    # Ephemeral IPs via VNICs
     ACTIVE_IDS=$(echo "$INSTANCES_JSON" | jq -r '.data | map(select(."lifecycle-state" != "TERMINATED")) | .[].id' 2>/dev/null)
     for id in $ACTIVE_IDS; do
         IP=$(oci compute instance list-vnics --instance-id "$id" --output json 2>/dev/null | jq -r '.data[0]."public-ip"')
         if [ "$IP" != "null" ] && [ ! -z "$IP" ]; then FOUND_IPS+="    ${GREEN}🌐${NC} $IP [$COMP_NAME]\n"; fi
     done
-    # IPs reservados
+    # Reserved IPs
     RES_IPS=$(oci network public-ip list --scope REGION --compartment-id "$comp_id" --output json 2>/dev/null | jq -r '.data[] | "\(."ip-address") (\(."display-name"))"')
     if [ ! -z "$RES_IPS" ]; then
         while read -r rip; do FOUND_IPS+="    ${GREEN}🌐${NC} $rip [$COMP_NAME] (Reservado)\n"; done <<< "$RES_IPS"
     fi
 done
 
-# --- SAÍDA ---
+# --- OUTPUT ---
 echo -e "\n${CYAN}[ INSTÂNCIAS DE COMPUTAÇÃO ]${NC}"
 [ -z "$FOUND_INSTANCES" ] && echo "  Nenhuma ativa." || echo -e "$FOUND_INSTANCES"
 
@@ -116,7 +116,7 @@ echo -e "${MAGENTA}-------------------------------------------------------------
 [ "$TOTAL_BOOT_GB" -le 200 ] && C=$GREEN || C=$RED
 echo -e "  Armazenamento: ${C}${TOTAL_BOOT_GB}GB${NC} / Limite 200GB"
 
-# Normaliza os totais com printf para evitar artefatos de ponto flutuante (.0999)
+# Normalize totals with printf to avoid floating-point artifacts (.0999)
 CLEAN_OCPU=$(printf "%.1f" "$TOTAL_ARM_OCPU" 2>/dev/null || echo "0.0")
 CLEAN_RAM=$(printf "%.1f" "$TOTAL_ARM_RAM" 2>/dev/null || echo "0.0")
 

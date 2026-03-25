@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# --- SUPRIMIR AVISOS ---
+# --- SUPPRESS WARNINGS ---
 export SUPPRESS_LABEL_WARNING=True
 
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 LOG_FILE="$SCRIPT_DIR/provisioned_vps.log"
 TEMP_MACHINES_FILE=$(mktemp)
 
-# --- CARREGAR SECRETS LOCAIS ---
+# --- LOAD LOCAL SECRETS ---
 ENV_FILE="$SCRIPT_DIR/.env"
 if [ -f "$ENV_FILE" ]; then
     set -a; source "$ENV_FILE"; set +a
@@ -16,7 +16,7 @@ else
     exit 1
 fi
 
-# --- DEFINIÇÃO DE CORES ---
+# --- COLOR DEFINITIONS ---
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
@@ -25,7 +25,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 BOLD='\033[1m'
 
-# Array para armazenar as instâncias criadas nesta sessão
+# Array to store instances created in this session
 PROVISIONED_MACHINES=()
 INSTANCE_TYPE=""
 
@@ -54,7 +54,7 @@ echo -e "  ${BOLD}Automated provisioning and hardening of OCI Always Free instan
 echo -e "  ----------------------------------------"
 echo ""
 
-# --- VERIFICAÇÕES INICIAIS (MODO ESTRITO) ---
+# --- INITIAL CHECKS (STRICT MODE) ---
 echo -ne "${YELLOW}[*] Validando dependências locais... ${NC}"
 
 if [ ! -f "$SCRIPT_DIR/harden.sh" ]; then
@@ -68,7 +68,7 @@ if [ ! -f "$SCRIPT_DIR/pentest_arsenal.sh" ]; then
     exit 1
 fi
 
-# --- VERIFICAÇÕES DA INSTÂNCIA CI SECURITY ---
+# --- CI SECURITY INSTANCE CHECKS ---
 CI_HARDENING="$SCRIPT_DIR/harden_ci.sh"
 CI_SETUP="$SCRIPT_DIR/setup_ci.sh"
 CI_READY=true
@@ -87,7 +87,7 @@ fi
 
 echo -e "${GREEN}Tudo OK!${NC}"
 
-# --- DESCOBERTA DINÂMICA ---
+# --- DYNAMIC DISCOVERY ---
 echo -e "${YELLOW}[*] Verificando ambiente OCI...${NC}"
 
 TENANCY_ID=$(grep "^tenancy=" ~/.oci/config | cut -d'=' -f2)
@@ -108,7 +108,7 @@ echo -e "  > Imagem (24.04):  ${GREEN}$IMAGE_ID${NC}"
 
 echo -e "${CYAN}---------------------------------------------------------------${NC}"
 
-# --- VERIFICAÇÃO DE CONFORMIDADE Always Free (Armazenamento) ---
+# --- ALWAYS FREE COMPLIANCE CHECK (Storage) ---
 USED_STORAGE=$(oci bv boot-volume list --availability-domain "$AD_NAME" --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq '[.data[] | select(."lifecycle-state" != "TERMINATED") | ."size-in-gbs"] | add')
 [ -z "$USED_STORAGE" ] || [ "$USED_STORAGE" == "null" ] && USED_STORAGE=0
 FREE_STORAGE=$((200 - USED_STORAGE))
@@ -119,10 +119,10 @@ if [ "$FREE_STORAGE" -lt 50 ]; then
 fi
 
 echo -e "${YELLOW}Selecione a Estratégia de Implantação:${NC}"
-echo "1) Instância Única Potente (4 OCPU / 24GB RAM)"
-echo "2) Par Balanceado          (2x 2 OCPU / 12GB RAM) - Lançamento Paralelo"
-echo "3) Cluster Pequeno         (4x 1 OCPU / 6GB RAM)  - Lançamento Paralelo"
-echo "4) Instância Única Simples (1 OCPU / 6GB RAM)"
+echo "1) Full Power              (4 OCPU / 24GB RAM)"
+echo "2) Balanced Pair           (2x 2 OCPU / 12GB RAM) - Parallel Launch"
+echo "3) Small Cluster           (4x 1 OCPU / 6GB RAM)  - Parallel Launch"
+echo "4) Single Instance         (1 OCPU / 6GB RAM)"
 echo "5) CI Security             (4 OCPU / 24GB RAM) - SonarQube + OWASP ZAP + Dep-Check"
 read -p "Seleção: " OPTION
 
@@ -137,7 +137,7 @@ launch_vps() {
     local NAME=$1
     local OCPU=$2
     local RAM=$3
-    local USERDATA="${4:-$SCRIPT_DIR/harden.sh}"   # padrão: harden.sh
+    local USERDATA="${4:-$SCRIPT_DIR/harden.sh}"   # default: harden.sh
     local START_TIME=$(date +%s)
 
     while true; do
@@ -177,14 +177,14 @@ launch_vps() {
             echo -e "${GREEN}[+] CAPACIDADE GARANTIDA ($NAME)! IP: $PUBLIC_IP${NC}"
             echo "$(date) | $NAME | IP: $PUBLIC_IP | ID: $INSTANCE_ID" >> "$LOG_FILE"
             
-            # Adiciona a máquina criada ao arquivo temporário (seguro para multi-threads)
+            # Adds the created machine to the temp file (thread-safe for parallel launches)
             echo "$NAME|$PUBLIC_IP" >> "$TEMP_MACHINES_FILE"
             break
         fi
     done
 }
 
-# Lógica de nomenclatura personalizada e paralelismo
+# Custom naming and parallelism logic
 echo -e "${CYAN}---------------------------------------------------------------${NC}"
 case $OPTION in
     1) 
@@ -228,19 +228,19 @@ case $OPTION in
         ;;
 esac
 
-# Lê do arquivo temporário para o array da sessão principal
+# Reads from temp file into the main session array
 while read -r line; do
     PROVISIONED_MACHINES+=("$line")
 done < "$TEMP_MACHINES_FILE"
 rm -f "$TEMP_MACHINES_FILE"
 
 # ==============================================================================
-# MENU PÓS-PROVISIONAMENTO (ORQUESTRAÇÃO)
+# POST-PROVISIONING MENU (ORCHESTRATION)
 # ==============================================================================
 if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
     get_ssh_port() {
         local IP=$1
-        # Testa a porta 22 primeiro, depois 2222 (o script de hardening pode alterá-la)
+        # Tests port 22 first, then 2222 (the hardening script may change it)
         if ssh -p 22 -q -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no -i "$SSH_PRIV_KEY" ubuntu@"$IP" "echo ok" 2>/dev/null | grep -q 'ok'; then
             echo "22"
         elif ssh -p 2222 -q -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no -i "$SSH_PRIV_KEY" ubuntu@"$IP" "echo ok" 2>/dev/null | grep -q 'ok'; then
@@ -257,7 +257,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
         echo -e "\n${CYAN}===============================================================${NC}"
         echo -e "${CYAN}>>> Conectando a: $TARGET_NAME ($TARGET_IP)${NC}"
 
-        # 1. AGUARDAR O SSH FICAR DISPONÍVEL
+        # 1. WAIT FOR SSH TO BECOME AVAILABLE
         echo -ne "${YELLOW}[*] Aguardando serviço SSH iniciar... ${NC}"
         SSH_PORT="0"
         while [ "$SSH_PORT" == "0" ]; do
@@ -266,8 +266,8 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
         done
         echo -e "${GREEN}Conectado na porta $SSH_PORT!${NC}"
 
-        # 2. TRANSMISSÃO DO HARDENING (CLOUD-INIT) EM TEMPO REAL (RESILIENTE)
-        echo -e "${YELLOW}[*] Transmitindo log do Hardening (Cloud-Init) ao vivo...${NC}"
+        # 2. STREAM HARDENING LOG (CLOUD-INIT) IN REAL TIME (RESILIENT)
+        echo -e "${YELLOW}[*] Acompanhando o log do Hardening (Cloud-Init) ao vivo...${NC}"
         echo -e "${CYAN}---------------------------------------------------------------${NC}"
         
         while true; do
@@ -284,8 +284,8 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
                     fi
                     
                     if ! kill -0 $TAIL_PID 2>/dev/null; then
-                        echo -e "${YELLOW}[!] Conexão interrompida. Reconectando para resgatar o log...${NC}"
-                        break 
+                        echo -e "${YELLOW}[!] Conexão interrompida. Reconectando para retomar o log...${NC}"
+                        break
                     fi
                 done
                 kill $TAIL_PID 2>/dev/null
@@ -296,7 +296,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
         echo -e "${CYAN}---------------------------------------------------------------${NC}"
         echo -e "${GREEN}[+] Hardening concluído! O gerenciador de pacotes (APT) está livre.${NC}"
 
-        # 3. ENVIO DO SCRIPT DE BOUNTY VIA SCP (RESILIENTE)
+        # 3. UPLOAD PENTEST SCRIPT VIA SCP (RESILIENT)
         echo -ne "${YELLOW}[*] Fazendo upload do script pentest_arsenal.sh... ${NC}"
         SSH_PORT=$(get_ssh_port "$TARGET_IP")
         
@@ -306,8 +306,8 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
         done
         echo -e "${GREEN}OK!${NC}"
 
-        # 4. EXECUÇÃO DA INSTALAÇÃO DO BUG BOUNTY
-        echo -e "${YELLOW}[*] Executando instalação do Bug Bounty (com logs direto do Cloud/VPS)...${NC}"
+        # 4. RUN BUG BOUNTY INSTALLATION
+        echo -e "${YELLOW}[*] Executando instalação do Bug Bounty (saída em tempo real)...${NC}"
         echo -e "${CYAN}---------------------------------------------------------------${NC}"
         
         PROFILE_ARG="--full"
@@ -323,7 +323,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
 
         if ssh -p "$SSH_PORT" -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no -i "$SSH_PRIV_KEY" ubuntu@"$TARGET_IP" "sudo sed -i 's/\r$//' /home/ubuntu/pentest_arsenal.sh && sudo chmod +x /home/ubuntu/pentest_arsenal.sh && sudo env VNC_PASSWORD='$VNC_PASSWORD' /home/ubuntu/pentest_arsenal.sh $PROFILE_ARG $GUI_ARG"; then
             echo -e "${CYAN}---------------------------------------------------------------${NC}"
-            echo -e "${GREEN}[+] Setup 100% finalizado em $TARGET_NAME!${NC}"
+            echo -e "${GREEN}[+] Instalação 100% concluída em $TARGET_NAME!${NC}"
         else
             echo -e "${CYAN}---------------------------------------------------------------${NC}"
             echo -e "${RED}[!] ERRO CRÍTICO durante a orquestração do Bug Bounty em $TARGET_NAME!${NC}"
@@ -338,7 +338,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
         echo -e "\n${CYAN}===============================================================${NC}"
         echo -e "${CYAN}>>> Configurando CI Security em: $TARGET_NAME ($TARGET_IP)${NC}"
 
-        # 1. AGUARDAR O SSH FICAR DISPONÍVEL
+        # 1. WAIT FOR SSH TO BECOME AVAILABLE
         echo -ne "${YELLOW}[*] Aguardando serviço SSH iniciar... ${NC}"
         SSH_PORT="0"
         while [ "$SSH_PORT" == "0" ]; do
@@ -347,7 +347,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
         done
         echo -e "${GREEN}Conectado na porta $SSH_PORT!${NC}"
 
-        # 2. TRANSMISSÃO DO CI HARDENING (CLOUD-INIT) EM TEMPO REAL
+        # 2. STREAM CI HARDENING LOG (CLOUD-INIT) IN REAL TIME
         echo -e "${YELLOW}[*] Monitorando Hardening da CI (Cloud-Init) ao vivo...${NC}"
         echo -e "${CYAN}---------------------------------------------------------------${NC}"
         
@@ -372,20 +372,20 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
         echo -e "${CYAN}---------------------------------------------------------------${NC}"
         echo -e "${GREEN}[+] Hardening concluído! Instalando ferramentas CI...${NC}"
 
-        # 3. ENVIO DO CI_SETUP.SH
+        # 3. UPLOAD CI_SETUP.SH
         echo -ne "${YELLOW}[*] Fazendo upload do script setup_ci.sh... ${NC}"
         while ! scp -P "$SSH_PORT" -q -o StrictHostKeyChecking=no -i "$SSH_PRIV_KEY" "$SCRIPT_DIR/setup_ci.sh" ubuntu@"$TARGET_IP":/home/ubuntu/setup_ci.sh; do
             sleep 5
         done
         echo -e "${GREEN}OK!${NC}"
 
-        # 4. EXECUÇÃO DA INSTALAÇÃO DO CI
+        # 4. RUN CI INSTALLATION
         echo -e "${YELLOW}[*] Executando configuração de ferramentas CI (ZAP, Sonar, Dep-Check)...${NC}"
         echo -e "${CYAN}---------------------------------------------------------------${NC}"
         
         if ssh -p "$SSH_PORT" -t -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no -i "$SSH_PRIV_KEY" ubuntu@"$TARGET_IP" "sudo sed -i 's/\r$//' /home/ubuntu/setup_ci.sh && sudo chmod +x /home/ubuntu/setup_ci.sh && sudo env NVD_API_KEY='$NVD_API_KEY' SONAR_DB_PASSWORD='$SONAR_DB_PASSWORD' /home/ubuntu/setup_ci.sh"; then
             echo -e "${CYAN}---------------------------------------------------------------${NC}"
-            echo -e "${GREEN}[+] CI Security 100% finalizado em $TARGET_NAME!${NC}"
+            echo -e "${GREEN}[+] CI Security 100% concluído em $TARGET_NAME!${NC}"
         else
             echo -e "${CYAN}---------------------------------------------------------------${NC}"
             echo -e "${RED}[!] ERRO CRÍTICO durante a orquestração da CI em $TARGET_NAME!${NC}"
@@ -394,7 +394,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
     }
 
     if [ "$INSTANCE_TYPE" = "CI" ]; then
-        # Fluxo pós-deploy da CI (ignora o menu genérico de bug bounty)
+        # CI post-deploy flow (skips the generic bug bounty menu)
         IFS='|' read -r m_name m_ip <<< "${PROVISIONED_MACHINES[0]}"
         echo -e "\n${MAGENTA}===============================================================${NC}"
         echo -e "${MAGENTA}   PÓS-DEPLOY: CONFIGURAÇÃO DE CI SECURITY                    ${NC}"
@@ -404,7 +404,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
             install_ci_on_machine "$m_name" "$m_ip"
         fi
     else
-        # Fluxo padrão de pós-deploy para Bug Bounty
+        # Standard post-deploy flow for Bug Bounty
         echo -e "\n${MAGENTA}===============================================================${NC}"
         echo -e "${MAGENTA}   PÓS-DEPLOY: MONITORAMENTO & FERRAMENTAS (BUG BOUNTY)       ${NC}"
         echo -e "${MAGENTA}===============================================================${NC}"
@@ -457,7 +457,7 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
     fi
 fi
 
-# Resumo de acesso às máquinas
+# Machine access summary
 echo -e "\n${MAGENTA}======= ACESSO ÀS MÁQUINAS =======${NC}"
 for item in "${PROVISIONED_MACHINES[@]}"; do
     IFS='|' read -r m_name m_ip <<< "$item"

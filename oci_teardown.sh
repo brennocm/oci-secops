@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# --- SUPRIMIR AVISOS ---
+# --- SUPPRESS WARNINGS ---
 export SUPPRESS_LABEL_WARNING=True
 
-# --- DEFINIÇÃO DO CAMINHO DO SCRIPT E LOG ---
+# --- SCRIPT PATH AND LOG FILE DEFINITION ---
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 LOG_FILE="$SCRIPT_DIR/provisioned_vps.log"
 
-# --- DEFINIÇÃO DE CORES ---
+# --- COLOR DEFINITIONS ---
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
@@ -41,7 +41,7 @@ echo -e "  ${BOLD}Automated provisioning and hardening of OCI Always Free instan
 echo -e "  ----------------------------------------"
 echo ""
 
-# --- DESCOBERTA DINÂMICA ---
+# --- DYNAMIC DISCOVERY ---
 echo -ne "${YELLOW}[*] Verificando ambiente OCI em busca de recursos ativos... ${NC}"
 
 TENANCY_ID=$(grep "^tenancy=" ~/.oci/config | cut -d'=' -f2)
@@ -51,11 +51,11 @@ if [ -z "$TENANCY_ID" ]; then
 fi
 echo -e "${GREEN}OK!${NC}"
 
-# Listar instâncias ARM ativas (Running, Starting ou Stopped)
+# List active ARM instances (Running, Starting or Stopped)
 echo -ne "${YELLOW}[*] Buscando instâncias ARM ativas... ${NC}"
 INSTANCES_JSON=$(oci compute instance list --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq -r '.data | map(select(."shape" == "VM.Standard.A1.Flex" and (."lifecycle-state" == "RUNNING" or ."lifecycle-state" == "STARTING" or ."lifecycle-state" == "STOPPED" or ."lifecycle-state" == "PROVISIONING"))) | .[] | "\(.id)|\(."display-name")|\(."lifecycle-state")"')
 
-# Se não encontrar instâncias
+# If no instances are found
 if [ -z "$INSTANCES_JSON" ]; then
     echo -e "${GREEN}Nenhuma encontrada.${NC}"
     echo -e "\n${CYAN}===============================================================${NC}"
@@ -73,11 +73,11 @@ if [ -z "$INSTANCES_JSON" ]; then
 fi
 echo -e "${GREEN}Encontradas!${NC}"
 
-# Criar um array para facilitar o processamento
+# Build an array for easier processing
 IFS=$'\n' read -rd '' -a INSTANCE_ARRAY <<< "$INSTANCES_JSON"
 NUM_INSTANCES=${#INSTANCE_ARRAY[@]}
 
-# --- MINI-AUDITORIA ANTES DO NUKE ---
+# --- MINI-AUDIT BEFORE DELETION ---
 echo -e "\n${MAGENTA}===============================================================${NC}"
 echo -e "${MAGENTA}                 RECURSOS ATUALMENTE ATIVOS                   ${NC}"
 echo -e "${MAGENTA}===============================================================${NC}"
@@ -103,15 +103,15 @@ read -p "Opção: " OPTION
 terminate_instance() {
     local OCID=$1
     local NAME=$2
-    echo -e "\n${RED}[!] Enviando ordem de destruição para: $NAME...${NC}"
+    echo -e "\n${RED}[!] Encerrando instância: $NAME...${NC}"
 
-    # Executa o comando de encerramento
+    # Execute the termination command
     oci compute instance terminate --instance-id "$OCID" --preserve-boot-volume false --force
 
     if [ $? -eq 0 ]; then
-        echo -ne "${YELLOW}[*] Status no painel: TERMINANDO. Aguardando finalização... ${NC}"
+        echo -ne "${YELLOW}[*] Aguardando encerramento... ${NC}"
 
-        # Loop de verificação em tempo real
+        # Real-time status check loop
         while true; do
             STATE=$(oci compute instance get --instance-id "$OCID" --output json 2>/dev/null | jq -r '.data."lifecycle-state"')
             
@@ -120,13 +120,13 @@ terminate_instance() {
                 echo -e "${GREEN}[+] Sucesso: $NAME e seu volume de boot de 50GB foram completamente apagados.${NC}"
                 break
             elif [ "$STATE" == "null" ] || [ -z "$STATE" ]; then
-                # Se a API retornar null, o recurso foi removido por completo
+                # If the API returns null, the resource has been fully removed
                 echo -e "${GREEN} REMOVIDO!${NC}"
-                echo -e "${GREEN}[+] Sucesso: $NAME desapareceu do ambiente.${NC}"
+                echo -e "${GREEN}[+] Sucesso: $NAME removida do ambiente.${NC}"
                 break
             fi
 
-            # Imprime um ponto a cada 5 segundos para indicar progresso
+            # Print a dot every 5 seconds to indicate progress
             echo -ne "${YELLOW}.${NC}"
             sleep 5
         done
@@ -159,7 +159,7 @@ case $OPTION in
                 terminate_instance "$OCID" "$NAME"
             done
             
-            # Apaga o log local após a destruição completa
+            # Delete the local log after full destruction
             if [ -f "$LOG_FILE" ]; then
                 rm -f "$LOG_FILE"
                 echo -e "\n${GREEN}[+] Log local ($LOG_FILE) removido com sucesso.${NC}"
