@@ -139,10 +139,12 @@ launch_vps() {
     local RAM=$3
     local USERDATA="${4:-$SCRIPT_DIR/harden.sh}"   # default: harden.sh
     local START_TIME=$(date +%s)
+    local RETRY_COUNT=0
+    local MAX_RETRIES=20  # 20 tentativas × 60s = ~20 minutos
 
     while true; do
         echo -e "\n${YELLOW}[...] Buscando capacidade: $NAME ($OCPU OCPU / ${RAM}GB RAM)${NC}"
-        
+
         LAUNCH_RES=$(oci compute instance launch \
             --availability-domain "$AD_NAME" \
             --compartment-id "$TENANCY_ID" \
@@ -155,9 +157,18 @@ launch_vps() {
             --user-data-file "$USERDATA" \
             --ssh-authorized-keys-file "$SSH_PUB_KEY" 2>&1)
 
-        if [[ $LAUNCH_RES == *"Out of capacity"* ]]; then
+        if [[ $LAUNCH_RES == *"Out of capacity"* || $LAUNCH_RES == *"Out of host capacity"* ]]; then
+            RETRY_COUNT=$(( RETRY_COUNT + 1 ))
             ELAPSED=$(( $(date +%s) - START_TIME ))
-            echo -e "${RED}[-] Sem capacidade para $NAME. Tentando novamente em 60s...${NC}"
+            if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
+                echo -e "\n${RED}[!] Limite de tentativas atingido para '$NAME' após ${ELAPSED}s.${NC}"
+                echo -e "${YELLOW}    A região ${AD_NAME%%-AD-*} está com alta demanda no momento.${NC}"
+                echo -e "${YELLOW}    Sugestão: tente novamente em horários de menor tráfego,${NC}"
+                echo -e "${YELLOW}    como madrugada ou início da manhã (horário UTC).${NC}"
+                echo -e "${YELLOW}    Considere também tentar uma estratégia com menor alocação de recursos.${NC}"
+                break
+            fi
+            echo -e "${RED}[-] Sem capacidade para $NAME. Tentativa $RETRY_COUNT/$MAX_RETRIES — nova tentativa em 60s...${NC}"
             sleep 60
         elif [[ $LAUNCH_RES == *"Error"* || $LAUNCH_RES == *"ServiceError"* || $LAUNCH_RES == *"Usage:"* ]]; then
             echo -e "${RED}[!] Comando OCI falhou para $NAME! Detalhes:\n$LAUNCH_RES${NC}"
@@ -458,20 +469,24 @@ if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
 fi
 
 # Machine access summary
-echo -e "\n${MAGENTA}======= ACESSO ÀS MÁQUINAS =======${NC}"
-for item in "${PROVISIONED_MACHINES[@]}"; do
-    IFS='|' read -r m_name m_ip <<< "$item"
-    echo -ne "${GREEN}$m_name${NC} -> "
-    
-    FPORT="22"
-    if ssh -p 2222 -q -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no -i "$SSH_PRIV_KEY" ubuntu@"$m_ip" "echo ok" 2>/dev/null | grep -q 'ok'; then
-        FPORT="2222"
-    fi
-    echo -e "${YELLOW}ssh -p $FPORT -i ~/.ssh/oci_vps_key ubuntu@$m_ip${NC}"
-    
-    if [ "$INSTANCE_TYPE" = "CI" ]; then
-        echo -e "  ${CYAN}Túnel SonarQube:  ssh -N -L 9000:localhost:9000 -p $FPORT -i ~/.ssh/oci_vps_key ubuntu@$m_ip${NC}"
-        echo -e "  ${CYAN}Depois acesse:    http://localhost:9000${NC}"
-    fi
-done
-echo -e "${MAGENTA}==================================${NC}\n"
+if [ ${#PROVISIONED_MACHINES[@]} -gt 0 ]; then
+    echo -e "\n${MAGENTA}======= ACESSO ÀS MÁQUINAS =======${NC}"
+    for item in "${PROVISIONED_MACHINES[@]}"; do
+        IFS='|' read -r m_name m_ip <<< "$item"
+        echo -ne "${GREEN}$m_name${NC} -> "
+
+        FPORT="22"
+        if ssh -p 2222 -q -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=no -i "$SSH_PRIV_KEY" ubuntu@"$m_ip" "echo ok" 2>/dev/null | grep -q 'ok'; then
+            FPORT="2222"
+        fi
+        echo -e "${YELLOW}ssh -p $FPORT -i ~/.ssh/oci_vps_key ubuntu@$m_ip${NC}"
+
+        if [ "$INSTANCE_TYPE" = "CI" ]; then
+            echo -e "  ${CYAN}Túnel SonarQube:  ssh -N -L 9000:localhost:9000 -p $FPORT -i ~/.ssh/oci_vps_key ubuntu@$m_ip${NC}"
+            echo -e "  ${CYAN}Depois acesse:    http://localhost:9000${NC}"
+        fi
+    done
+    echo -e "${MAGENTA}==================================${NC}\n"
+else
+    echo -e "\n${RED}[!] Nenhuma instância foi provisionada com sucesso.${NC}"
+fi
