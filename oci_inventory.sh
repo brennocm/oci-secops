@@ -44,6 +44,45 @@ if [ -z "$TENANCY_ID" ]; then
     exit 1
 fi
 
+# ==============================================================================
+# ALWAYS FREE CEILINGS vs TENANCY QUOTA
+# Mirrors oci_provision.sh: the documented Always Free allotment is NOT the
+# effective limit. Oracle caps Ampere A1 per tenancy and per region, so the
+# quota is read live instead of assumed.
+# ==============================================================================
+AF_MAX_OCPU=4
+AF_MAX_RAM=24
+AF_MAX_STORAGE=200
+
+AD_NAME=$(oci iam availability-domain list --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq -r '.data[0].name')
+
+get_limit_field() {
+    # $1 = limit name, $2 = field (available|used)
+    oci limits resource-availability get \
+        --service-name compute \
+        --limit-name "$1" \
+        --compartment-id "$TENANCY_ID" \
+        --availability-domain "$AD_NAME" \
+        --output json 2>/dev/null | jq -r ".data.$2 // empty"
+}
+
+if [ -n "$AD_NAME" ] && [ "$AD_NAME" != "null" ]; then
+    Q_OCPU_AVAIL=$(get_limit_field "standard-a1-core-count" "available")
+    Q_RAM_AVAIL=$(get_limit_field "standard-a1-memory-count" "available")
+    Q_OCPU_USED=$(get_limit_field "standard-a1-core-count" "used")
+    Q_RAM_USED=$(get_limit_field "standard-a1-memory-count" "used")
+fi
+
+if [[ "$Q_OCPU_AVAIL" =~ ^[0-9]+$ ]] && [[ "$Q_RAM_AVAIL" =~ ^[0-9]+$ ]]; then
+    QUOTA_OK=true
+    [[ "$Q_OCPU_USED" =~ ^[0-9]+$ ]] || Q_OCPU_USED=0
+    [[ "$Q_RAM_USED" =~ ^[0-9]+$ ]] || Q_RAM_USED=0
+    Q_OCPU_LIMIT=$(( Q_OCPU_USED + Q_OCPU_AVAIL ))
+    Q_RAM_LIMIT=$(( Q_RAM_USED + Q_RAM_AVAIL ))
+else
+    QUOTA_OK=false
+fi
+
 echo -e "${YELLOW}[*] Varrendo todos os compartimentos recursivamente...${NC}"
 # Retrieves all sub-compartments and adds the root tenancy
 SUB_COMPS=$(oci iam compartment list --compartment-id "$TENANCY_ID" --compartment-id-in-subtree true --access-level ACCESSIBLE --output json 2>/dev/null | jq -r '.data[] | select(."lifecycle-state" == "ACTIVE") | .id')
@@ -113,16 +152,60 @@ echo -e "\n${MAGENTA}-----------------------------------------------------------
 echo -e "${MAGENTA}     RESUMO DE CONFORMIDADE ALWAYS FREE (RECURSIVO)           ${NC}"
 echo -e "${MAGENTA}---------------------------------------------------------------${NC}"
 
-[ "$TOTAL_BOOT_GB" -le 200 ] && C=$GREEN || C=$RED
-echo -e "  Armazenamento: ${C}${TOTAL_BOOT_GB}GB${NC} / Limite 200GB"
-
 # Normalize totals with printf to avoid floating-point artifacts (.0999)
 CLEAN_OCPU=$(printf "%.1f" "$TOTAL_ARM_OCPU" 2>/dev/null || echo "0.0")
 CLEAN_RAM=$(printf "%.1f" "$TOTAL_ARM_RAM" 2>/dev/null || echo "0.0")
 
-[ $(echo "$CLEAN_OCPU <= 4" | bc 2>/dev/null || echo 1) -eq 1 ] && C=$GREEN || C=$RED
-echo -e "  ARM OCPUs: ${C}${CLEAN_OCPU}${NC} / Limite 4"
+if [ "$QUOTA_OK" = true ]; then
+    printf "  %-16s %-12s %-12s %s\n" "RECURSO" "EM USO" "SUA COTA" "TETO FREE"
 
-[ $(echo "$CLEAN_RAM <= 24" | bc 2>/dev/null || echo 1) -eq 1 ] && C=$GREEN || C=$RED
-echo -e "  ARM RAM: ${C}${CLEAN_RAM}GB${NC} / Limite 24GB"
+    # The binding limit is whichever is smaller: tenancy quota or Always Free
+    [ $(echo "$CLEAN_OCPU >= $Q_OCPU_LIMIT" | bc 2>/dev/null || echo 0) -eq 1 ] && C=$RED || C=$GREEN
+    printf "  %-16s ${C}%-12s${NC} %-12s %s\n" "ARM OCPUs" "$CLEAN_OCPU" "$Q_OCPU_LIMIT" "$AF_MAX_OCPU"
+
+    [ $(echo "$CLEAN_RAM >= $Q_RAM_LIMIT" | bc 2>/dev/null || echo 0) -eq 1 ] && C=$RED || C=$GREEN
+    printf "  %-16s ${C}%-12s${NC} %-12s %s\n" "ARM RAM" "${CLEAN_RAM}GB" "${Q_RAM_LIMIT}GB" "${AF_MAX_RAM}GB"
+
+    [ "$TOTAL_BOOT_GB" -ge "$AF_MAX_STORAGE" ] && C=$RED || C=$GREEN
+    printf "  %-16s ${C}%-12s${NC} %-12s %s\n" "Armazenamento" "${TOTAL_BOOT_GB}GB" "-" "${AF_MAX_STORAGE}GB"
+
+    # Headroom = smaller of (quota left) and (Always Free left)
+    AF_OCPU_LEFT=$(( AF_MAX_OCPU - Q_OCPU_USED ))
+    AF_RAM_LEFT=$(( AF_MAX_RAM - Q_RAM_USED ))
+    H_OCPU=$Q_OCPU_AVAIL; [ "$H_OCPU" -gt "$AF_OCPU_LEFT" ] && H_OCPU=$AF_OCPU_LEFT
+    H_RAM=$Q_RAM_AVAIL;   [ "$H_RAM" -gt "$AF_RAM_LEFT" ] && H_RAM=$AF_RAM_LEFT
+    H_DISK=$(( AF_MAX_STORAGE - TOTAL_BOOT_GB ))
+    [ "$H_OCPU" -lt 0 ] && H_OCPU=0; [ "$H_RAM" -lt 0 ] && H_RAM=0; [ "$H_DISK" -lt 0 ] && H_DISK=0
+
+    echo ""
+    if [ "$H_OCPU" -lt 1 ] || [ "$H_RAM" -lt 1 ]; then
+        echo -e "  ${YELLOW}Margem para novo provisionamento: esgotada.${NC}"
+        echo -e "  ${YELLOW}Libere recursos com ./oci_teardown.sh antes de provisionar.${NC}"
+    else
+        echo -e "  ${GREEN}Margem para novo provisionamento: ${BOLD}${H_OCPU} OCPU / ${H_RAM}GB RAM / ${H_DISK}GB disco${NC}"
+        echo -e "  ${CYAN}Use a opção 6 (Limited Full Power) do oci_provision.sh.${NC}"
+    fi
+
+    # PAYG accounts can legally exceed Always Free -- and get billed for it
+    if [ "$Q_OCPU_LIMIT" -gt "$AF_MAX_OCPU" ] || [ "$Q_RAM_LIMIT" -gt "$AF_MAX_RAM" ]; then
+        echo ""
+        echo -e "  ${RED}[!] ATENÇÃO: sua cota (${Q_OCPU_LIMIT} OCPU / ${Q_RAM_LIMIT}GB) excede o teto${NC}"
+        echo -e "  ${RED}    Always Free. Recursos acima de ${AF_MAX_OCPU} OCPU / ${AF_MAX_RAM}GB SERÃO FATURADOS.${NC}"
+    fi
+
+    # Cross-check: recursive scan vs authoritative quota API
+    if [ $(echo "$CLEAN_OCPU != $Q_OCPU_USED" | bc 2>/dev/null || echo 0) -eq 1 ]; then
+        echo ""
+        echo -e "  ${YELLOW}[!] Divergência: varredura encontrou ${CLEAN_OCPU} OCPU, a API contabiliza ${Q_OCPU_USED}.${NC}"
+        echo -e "  ${YELLOW}    Pode haver instâncias em compartimentos sem permissão de leitura.${NC}"
+    fi
+else
+    echo -e "  ${YELLOW}[!] Cota da tenancy indisponível — exibindo apenas o teto Always Free.${NC}"
+    [ $(echo "$CLEAN_OCPU <= $AF_MAX_OCPU" | bc 2>/dev/null || echo 1) -eq 1 ] && C=$GREEN || C=$RED
+    echo -e "  ARM OCPUs: ${C}${CLEAN_OCPU}${NC} / Teto ${AF_MAX_OCPU}"
+    [ $(echo "$CLEAN_RAM <= $AF_MAX_RAM" | bc 2>/dev/null || echo 1) -eq 1 ] && C=$GREEN || C=$RED
+    echo -e "  ARM RAM: ${C}${CLEAN_RAM}GB${NC} / Teto ${AF_MAX_RAM}GB"
+    [ "$TOTAL_BOOT_GB" -le "$AF_MAX_STORAGE" ] && C=$GREEN || C=$RED
+    echo -e "  Armazenamento: ${C}${TOTAL_BOOT_GB}GB${NC} / Teto ${AF_MAX_STORAGE}GB"
+fi
 echo -e "${MAGENTA}---------------------------------------------------------------${NC}"

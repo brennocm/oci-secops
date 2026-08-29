@@ -106,7 +106,57 @@ IMAGE_ID=$(oci compute image list --compartment-id "$TENANCY_ID" --operating-sys
 if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" == "null" ]; then exit 1; fi
 echo -e "  > Imagem (24.04):  ${GREEN}$IMAGE_ID${NC}"
 
+# --- A1 QUOTA DISCOVERY (feeds the "Limited Full Power" strategy) ---
+# Reads the tenancy's real Ampere A1 allowance instead of assuming the
+# documented 4 OCPU / 24GB: Oracle caps it per-tenancy/per-region.
+get_limit_available() {
+    oci limits resource-availability get \
+        --service-name compute \
+        --limit-name "$1" \
+        --compartment-id "$TENANCY_ID" \
+        --availability-domain "$AD_NAME" \
+        --output json 2>/dev/null | jq -r '.data.available // empty'
+}
+
+get_limit_used() {
+    oci limits resource-availability get \
+        --service-name compute \
+        --limit-name "$1" \
+        --compartment-id "$TENANCY_ID" \
+        --availability-domain "$AD_NAME" \
+        --output json 2>/dev/null | jq -r '.data.used // empty'
+}
+
+A1_CORES_FREE=$(get_limit_available "standard-a1-core-count")
+A1_RAM_FREE=$(get_limit_available "standard-a1-memory-count")
+A1_CORES_USED=$(get_limit_used "standard-a1-core-count")
+A1_RAM_USED=$(get_limit_used "standard-a1-memory-count")
+[[ "$A1_CORES_USED" =~ ^[0-9]+$ ]] || A1_CORES_USED=0
+[[ "$A1_RAM_USED" =~ ^[0-9]+$ ]] || A1_RAM_USED=0
+
+if [[ "$A1_CORES_FREE" =~ ^[0-9]+$ ]] && [[ "$A1_RAM_FREE" =~ ^[0-9]+$ ]]; then
+    QUOTA_OK=true
+    echo -e "  > Cota A1 livre:   ${GREEN}${A1_CORES_FREE} OCPU / ${A1_RAM_FREE}GB RAM${NC}"
+else
+    QUOTA_OK=false
+    echo -e "  > Cota A1 livre:   ${YELLOW}indeterminada (opção 6 indisponível)${NC}"
+fi
+
 echo -e "${CYAN}---------------------------------------------------------------${NC}"
+
+# ==============================================================================
+# ALWAYS FREE HARD CEILINGS
+# The tenancy quota CANNOT be trusted as a safety net: on a Free Tier account
+# exceeding the allotment is rejected (LimitExceeded), but on an upgraded
+# Pay-As-You-Go account the very same launch succeeds and is BILLED. The OCI
+# API does not expose which kind of account this is, so these ceilings are
+# enforced locally, on every launch, regardless of what the quota allows.
+# ==============================================================================
+AF_SHAPE="VM.Standard.A1.Flex"   # only free-eligible shape in this region
+AF_MAX_OCPU=4                    # Always Free: 4 OCPU total, all instances
+AF_MAX_RAM=24                    # Always Free: 24GB RAM total, all instances
+AF_MAX_STORAGE=200               # Always Free: 200GB block storage total
+AF_VPU=10                        # Balanced performance; higher tiers are paid
 
 # --- ALWAYS FREE COMPLIANCE CHECK (Storage) ---
 USED_STORAGE=$(oci bv boot-volume list --availability-domain "$AD_NAME" --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq '[.data[] | select(."lifecycle-state" != "TERMINATED") | ."size-in-gbs"] | add')
@@ -124,12 +174,64 @@ echo "2) Balanced Pair           (2x 2 OCPU / 12GB RAM) - Parallel Launch"
 echo "3) Small Cluster           (4x 1 OCPU / 6GB RAM)  - Parallel Launch"
 echo "4) Single Instance         (1 OCPU / 6GB RAM)"
 echo "5) CI Security             (4 OCPU / 24GB RAM) - SonarQube + OWASP ZAP + Dep-Check"
+echo -e "6) ${BOLD}Limited Full Power${NC}     (máximo que a SUA cota permite) - Auto-detectado"
 read -p "Seleção: " OPTION
 
-check_storage_req() {
-    if [ "$1" -gt "$FREE_STORAGE" ]; then
-        echo -e "${RED}[!] ERRO: A seleção exige $1GB, mas você só tem ${FREE_STORAGE}GB disponíveis.${NC}"
-        exit 1
+# Validates a whole deployment strategy against the Always Free allotment
+# BEFORE anything is launched. Accounts for resources already in use so a
+# second run cannot push the tenancy over the ceiling.
+check_free_tier_budget() {
+    local REQ_OCPU=$1 REQ_RAM=$2 REQ_STORAGE=$3 REQ_COUNT=$4
+    local TOT_OCPU=$(( A1_CORES_USED + REQ_OCPU ))
+    local TOT_RAM=$(( A1_RAM_USED + REQ_RAM ))
+    local BLOCKED=false
+
+    echo -e "${CYAN}---------------------------------------------------------------${NC}"
+    echo -e "${BOLD}[*] Verificação Always Free (${REQ_COUNT} instância(s)):${NC}"
+    printf "    %-22s %-14s %-14s %s\n" "RECURSO" "JÁ EM USO" "ESTA EXECUÇÃO" "TETO FREE"
+    printf "    %-22s %-14s %-14s %s\n" "OCPU (A1)" "$A1_CORES_USED" "+$REQ_OCPU" "$AF_MAX_OCPU"
+    printf "    %-22s %-14s %-14s %s\n" "RAM GB (A1)" "$A1_RAM_USED" "+$REQ_RAM" "$AF_MAX_RAM"
+    printf "    %-22s %-14s %-14s %s\n" "Disco GB" "$USED_STORAGE" "+$REQ_STORAGE" "$AF_MAX_STORAGE"
+
+    # 1. Always Free ceiling (protects PAY-AS-YOU-GO accounts from billing)
+    if [ "$TOT_OCPU" -gt "$AF_MAX_OCPU" ]; then
+        echo -e "${RED}[!] BLOQUEADO: ${TOT_OCPU} OCPU excede o teto Always Free de ${AF_MAX_OCPU}.${NC}"
+        BLOCKED=true
+    fi
+    if [ "$TOT_RAM" -gt "$AF_MAX_RAM" ]; then
+        echo -e "${RED}[!] BLOQUEADO: ${TOT_RAM}GB de RAM excede o teto Always Free de ${AF_MAX_RAM}GB.${NC}"
+        BLOCKED=true
+    fi
+    if [ $(( USED_STORAGE + REQ_STORAGE )) -gt "$AF_MAX_STORAGE" ]; then
+        echo -e "${RED}[!] BLOQUEADO: $(( USED_STORAGE + REQ_STORAGE ))GB de disco excede o teto Always Free de ${AF_MAX_STORAGE}GB.${NC}"
+        BLOCKED=true
+    fi
+
+    if [ "$BLOCKED" = true ]; then
+        echo -e "${RED}[!] Esta estratégia sairia do Always Free e poderia gerar cobrança.${NC}"
+        echo -e "${YELLOW}    Use a opção 6 (Limited Full Power) para dimensionar automaticamente.${NC}"
+        rm -f "$TEMP_MACHINES_FILE"; exit 1
+    fi
+
+    # 2. Tenancy quota (would fail with LimitExceeded / partial deploy)
+    if [ "$QUOTA_OK" = true ]; then
+        if [ "$REQ_OCPU" -gt "$A1_CORES_FREE" ] || [ "$REQ_RAM" -gt "$A1_RAM_FREE" ]; then
+            echo -e "${RED}[!] BLOQUEADO: sua cota A1 é de ${A1_CORES_FREE} OCPU / ${A1_RAM_FREE}GB —${NC}"
+            echo -e "${RED}    insuficiente para ${REQ_OCPU} OCPU / ${REQ_RAM}GB.${NC}"
+            if [ "$REQ_COUNT" -gt 1 ]; then
+                echo -e "${YELLOW}    Lançamento paralelo abortado para evitar deploy parcial.${NC}"
+            fi
+            echo -e "${YELLOW}    Use a opção 6 (Limited Full Power) para caber na sua cota.${NC}"
+            rm -f "$TEMP_MACHINES_FILE"; exit 1
+        fi
+    fi
+
+    echo -e "${GREEN}[+] Dentro do Always Free. Nenhuma cobrança será gerada.${NC}"
+    echo -e "${CYAN}---------------------------------------------------------------${NC}"
+    read -p "➔ Confirmar provisionamento? [S/n]: " CONFIRM_FT
+    if [[ "$CONFIRM_FT" =~ ^[nN]$ ]]; then
+        echo -e "${YELLOW}[*] Cancelado pelo usuário.${NC}"
+        rm -f "$TEMP_MACHINES_FILE"; exit 0
     fi
 }
 
@@ -138,20 +240,43 @@ launch_vps() {
     local OCPU=$2
     local RAM=$3
     local USERDATA="${4:-$SCRIPT_DIR/harden.sh}"   # default: harden.sh
+    local BOOT_GB="${5:-}"                         # optional: boot volume size in GB
+    # Boot volume size and performance tier are NOT standalone CLI options:
+    # both live inside --source-details, alongside the image id.
+    local BOOT_DESC=""
+    local SRC_DETAILS="{\"sourceType\":\"image\",\"imageId\":\"$IMAGE_ID\",\"bootVolumeVpusPerGB\":$AF_VPU"
+    if [ -n "$BOOT_GB" ]; then
+        SRC_DETAILS="${SRC_DETAILS},\"bootVolumeSizeInGBs\":$BOOT_GB"
+        BOOT_DESC=" / ${BOOT_GB}GB disco"
+    fi
+    SRC_DETAILS="${SRC_DETAILS}}"
+    # Last line of defence: a single instance can never exceed the whole
+    # Always Free allotment, whatever the caller passed in.
+    if [ "$OCPU" -gt "$AF_MAX_OCPU" ] || [ "$RAM" -gt "$AF_MAX_RAM" ]; then
+        echo -e "${RED}[!] ABORTADO ($NAME): ${OCPU} OCPU / ${RAM}GB excede o Always Free.${NC}"
+        return 1
+    fi
+    if [ -n "$BOOT_GB" ] && [ "$BOOT_GB" -gt "$AF_MAX_STORAGE" ]; then
+        echo -e "${RED}[!] ABORTADO ($NAME): disco de ${BOOT_GB}GB excede o Always Free.${NC}"
+        return 1
+    fi
+
     local START_TIME=$(date +%s)
     local RETRY_COUNT=0
     local MAX_RETRIES=20  # 20 tentativas × 60s = ~20 minutos
+    local RATE_COUNT=0
+    local MAX_RATE_RETRIES=6  # backoff exponencial: 60s..600s (~35 min)
 
     while true; do
-        echo -e "\n${YELLOW}[...] Buscando capacidade: $NAME ($OCPU OCPU / ${RAM}GB RAM)${NC}"
+        echo -e "\n${YELLOW}[...] Buscando capacidade: $NAME ($OCPU OCPU / ${RAM}GB RAM${BOOT_DESC})${NC}"
 
         LAUNCH_RES=$(oci compute instance launch \
             --availability-domain "$AD_NAME" \
             --compartment-id "$TENANCY_ID" \
-            --shape "VM.Standard.A1.Flex" \
+            --shape "$AF_SHAPE" \
             --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $RAM}" \
+            --source-details "$SRC_DETAILS" \
             --display-name "$NAME" \
-            --image-id "$IMAGE_ID" \
             --subnet-id "$SUBNET_ID" \
             --assign-public-ip true \
             --user-data-file "$USERDATA" \
@@ -170,6 +295,26 @@ launch_vps() {
             fi
             echo -e "${RED}[-] Sem capacidade para $NAME. Tentativa $RETRY_COUNT/$MAX_RETRIES — nova tentativa em 60s...${NC}"
             sleep 60
+        elif [[ $LAUNCH_RES == *"TooManyRequests"* ]]; then
+            # HTTP 429: the launch_instance API is rate limited per user and
+            # needs exponential backoff, not the flat retry used for capacity.
+            RATE_COUNT=$(( RATE_COUNT + 1 ))
+            if [ "$RATE_COUNT" -ge "$MAX_RATE_RETRIES" ]; then
+                echo -e "\n${RED}[!] Rate limit persistente da API para '$NAME'.${NC}"
+                echo -e "${YELLOW}    A OCI limita chamadas de launch_instance por usuário.${NC}"
+                echo -e "${YELLOW}    Aguarde ~15 minutos sem novas tentativas e execute novamente.${NC}"
+                break
+            fi
+            BACKOFF=$(( 60 * (2 ** (RATE_COUNT - 1)) ))
+            [ "$BACKOFF" -gt 600 ] && BACKOFF=600
+            echo -e "${YELLOW}[-] Rate limit da API (429). Tentativa $RATE_COUNT/$MAX_RATE_RETRIES — aguardando ${BACKOFF}s...${NC}"
+            sleep "$BACKOFF"
+        elif [[ $LAUNCH_RES == *"LimitExceeded"* ]]; then
+            echo -e "${RED}[!] Cota excedida para '$NAME' ($OCPU OCPU / ${RAM}GB RAM).${NC}"
+            echo -e "${YELLOW}    Sua cota A1 livre é de ${A1_CORES_FREE:-?} OCPU / ${A1_RAM_FREE:-?}GB RAM.${NC}"
+            echo -e "${YELLOW}    Use a opção 6 (Limited Full Power) para caber automaticamente,${NC}"
+            echo -e "${YELLOW}    ou peça aumento em: Console > Limits, Quotas and Usage.${NC}"
+            break
         elif [[ $LAUNCH_RES == *"Error"* || $LAUNCH_RES == *"ServiceError"* || $LAUNCH_RES == *"Usage:"* ]]; then
             echo -e "${RED}[!] Comando OCI falhou para $NAME! Detalhes:\n$LAUNCH_RES${NC}"
             break
@@ -199,26 +344,26 @@ launch_vps() {
 echo -e "${CYAN}---------------------------------------------------------------${NC}"
 case $OPTION in
     1) 
-        check_storage_req 50
+        check_free_tier_budget 4 24 50 1
         read -p "Nome da instância [Pressione Enter para 'ARM-Monster']: " CUSTOM_NAME
         launch_vps "${CUSTOM_NAME:-ARM-Monster}" 4 24 
         ;;
     2) 
-        check_storage_req 100
+        check_free_tier_budget 4 24 100 2
         read -p "Prefixo das instâncias [Pressione Enter para 'ARM-Twin']: " CUSTOM_PREFIX
         PREFIX=${CUSTOM_PREFIX:-ARM-Twin}
         for i in {1..2}; do launch_vps "${PREFIX}-$i" 2 12 & done 
         wait
         ;;
     3) 
-        check_storage_req 200
+        check_free_tier_budget 4 24 200 4
         read -p "Prefixo das instâncias [Pressione Enter para 'ARM-Small']: " CUSTOM_PREFIX
         PREFIX=${CUSTOM_PREFIX:-ARM-Small}
         for i in {1..4}; do launch_vps "${PREFIX}-$i" 1 6 & done 
         wait
         ;;
     4) 
-        check_storage_req 50
+        check_free_tier_budget 1 6 50 1
         read -p "Nome da instância [Pressione Enter para 'ARM-Single']: " CUSTOM_NAME
         launch_vps "${CUSTOM_NAME:-ARM-Single}" 1 6 
         ;;
@@ -227,10 +372,59 @@ case $OPTION in
             echo -e "${RED}[!] harden_ci.sh ou setup_ci.sh ausente.${NC}"
             rm -f "$TEMP_MACHINES_FILE"; exit 1
         fi
-        check_storage_req 50
+        check_free_tier_budget 4 24 50 1
         read -p "Nome da instância [Pressione Enter para 'ARM-CI-Security']: " CUSTOM_NAME
         INSTANCE_TYPE="CI"
         launch_vps "${CUSTOM_NAME:-ARM-CI-Security}" 4 24 "$SCRIPT_DIR/harden_ci.sh"
+        ;;
+    6)
+        if [ "$QUOTA_OK" = false ]; then
+            echo -e "${RED}[!] Não foi possível consultar sua cota A1 via API.${NC}"
+            echo -e "${YELLOW}    Verifique as permissões IAM ou escolha uma opção fixa (1-5).${NC}"
+            rm -f "$TEMP_MACHINES_FILE"; exit 1
+        fi
+
+        if [ "$A1_CORES_FREE" -lt 1 ] || [ "$A1_RAM_FREE" -lt 1 ]; then
+            echo -e "${RED}[!] Sem cota A1 livre (${A1_CORES_FREE} OCPU / ${A1_RAM_FREE}GB).${NC}"
+            echo -e "${YELLOW}    Termine instâncias existentes ou peça aumento de limite.${NC}"
+            rm -f "$TEMP_MACHINES_FILE"; exit 1
+        fi
+
+        # Takes the SMALLER of: what the tenancy quota allows, and what is
+        # left of the Always Free allotment. The quota alone is not a safety
+        # net -- on a Pay-As-You-Go account it can legally exceed Always Free.
+        AF_OCPU_LEFT=$(( AF_MAX_OCPU - A1_CORES_USED ))
+        AF_RAM_LEFT=$(( AF_MAX_RAM - A1_RAM_USED ))
+
+        MAX_OCPU=$A1_CORES_FREE
+        [ "$MAX_OCPU" -gt "$AF_OCPU_LEFT" ] && MAX_OCPU=$AF_OCPU_LEFT
+        MAX_RAM=$A1_RAM_FREE
+        [ "$MAX_RAM" -gt "$AF_RAM_LEFT" ] && MAX_RAM=$AF_RAM_LEFT
+
+        # A1.Flex hardware ratio: at most 64GB per OCPU
+        RAM_CEILING=$(( MAX_OCPU * 64 ))
+        [ "$MAX_RAM" -gt "$RAM_CEILING" ] && MAX_RAM=$RAM_CEILING
+
+        if [ "$MAX_OCPU" -lt 1 ] || [ "$MAX_RAM" -lt 1 ]; then
+            echo -e "${RED}[!] Sem margem no Always Free (${MAX_OCPU} OCPU / ${MAX_RAM}GB restantes).${NC}"
+            rm -f "$TEMP_MACHINES_FILE"; exit 1
+        fi
+
+        MAX_BOOT=$FREE_STORAGE
+        [ "$MAX_BOOT" -gt "$AF_MAX_STORAGE" ] && MAX_BOOT=$AF_MAX_STORAGE
+
+        echo -e "${GREEN}[*] Máximo dentro do seu Always Free: ${BOLD}${MAX_OCPU} OCPU / ${MAX_RAM}GB RAM / até ${MAX_BOOT}GB de disco${NC}"
+        echo -e "${YELLOW}    (usar todo o disco impede uma segunda instância nesta tenancy)${NC}"
+        read -p "Tamanho do boot volume em GB [Enter para ${MAX_BOOT}]: " CUSTOM_BOOT
+        BOOT_GB=${CUSTOM_BOOT:-$MAX_BOOT}
+        if ! [[ "$BOOT_GB" =~ ^[0-9]+$ ]] || [ "$BOOT_GB" -lt 50 ] || [ "$BOOT_GB" -gt "$MAX_BOOT" ]; then
+            echo -e "${RED}[!] Valor inválido. Informe um número entre 50 e ${MAX_BOOT}.${NC}"
+            rm -f "$TEMP_MACHINES_FILE"; exit 1
+        fi
+
+        check_free_tier_budget "$MAX_OCPU" "$MAX_RAM" "$BOOT_GB" 1
+        read -p "Nome da instância [Pressione Enter para 'ARM-Limited-Monster']: " CUSTOM_NAME
+        launch_vps "${CUSTOM_NAME:-ARM-Limited-Monster}" "$MAX_OCPU" "$MAX_RAM" "$SCRIPT_DIR/harden.sh" "$BOOT_GB"
         ;;
     *) 
         echo -e "${RED}Seleção inválida.${NC}"
