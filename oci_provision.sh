@@ -94,9 +94,19 @@ TENANCY_ID=$(grep "^tenancy=" ~/.oci/config | cut -d'=' -f2)
 if [ -z "$TENANCY_ID" ]; then exit 1; fi
 echo -e "  > Compartimento Raiz: ${GREEN}$TENANCY_ID${NC}"
 
-AD_NAME=$(oci iam availability-domain list --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq -r '.data[0].name')
-if [ -z "$AD_NAME" ] || [ "$AD_NAME" == "null" ]; then exit 1; fi
-echo -e "  > Nome do AD:      ${GREEN}$AD_NAME${NC}"
+# A1 capacity is allocated per Availability Domain: a region with 3 ADs gives
+# three independent chances of finding a host, so all of them are collected.
+mapfile -t AD_LIST < <(oci iam availability-domain list --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq -r '.data[].name')
+if [ ${#AD_LIST[@]} -eq 0 ]; then
+    echo -e "${RED}[!] ERRO: nenhum Availability Domain retornado pela API.${NC}"
+    exit 1
+fi
+AD_NAME="${AD_LIST[0]}"   # AD de referência para consultas de AD única
+if [ ${#AD_LIST[@]} -eq 1 ]; then
+    echo -e "  > Nome do AD:      ${GREEN}$AD_NAME${NC}"
+else
+    echo -e "  > ADs na região:   ${GREEN}${#AD_LIST[@]} → ${AD_LIST[*]}${NC}"
+fi
 
 SUBNET_ID=$(oci network subnet list --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq -r '.data[0].id')
 if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" == "null" ]; then exit 1; fi
@@ -109,36 +119,40 @@ echo -e "  > Imagem (24.04):  ${GREEN}$IMAGE_ID${NC}"
 # --- A1 QUOTA DISCOVERY (feeds the "Limited Full Power" strategy) ---
 # Reads the tenancy's real Ampere A1 allowance instead of assuming the
 # documented 4 OCPU / 24GB: Oracle caps it per-tenancy/per-region.
-get_limit_available() {
+get_limit() {
+    # $1 = limit-name, $2 = availability domain, $3 = campo (available|used)
     oci limits resource-availability get \
         --service-name compute \
         --limit-name "$1" \
         --compartment-id "$TENANCY_ID" \
-        --availability-domain "$AD_NAME" \
-        --output json 2>/dev/null | jq -r '.data.available // empty'
+        --availability-domain "$2" \
+        --output json 2>/dev/null | jq -r ".data.\"$3\" // empty"
 }
 
-get_limit_used() {
-    oci limits resource-availability get \
-        --service-name compute \
-        --limit-name "$1" \
-        --compartment-id "$TENANCY_ID" \
-        --availability-domain "$AD_NAME" \
-        --output json 2>/dev/null | jq -r '.data.used // empty'
-}
+# "livre" = melhor colocação em UMA AD (uma instância vive em uma só AD).
+# "em uso" = soma de todas as ADs (o teto Always Free é da tenancy inteira).
+A1_CORES_FREE=0
+A1_RAM_FREE=0
+A1_CORES_USED=0
+A1_RAM_USED=0
+QUOTA_OK=false
+for AD in "${AD_LIST[@]}"; do
+    C_FREE=$(get_limit "standard-a1-core-count"   "$AD" "available")
+    R_FREE=$(get_limit "standard-a1-memory-count" "$AD" "available")
+    C_USED=$(get_limit "standard-a1-core-count"   "$AD" "used")
+    R_USED=$(get_limit "standard-a1-memory-count" "$AD" "used")
+    [[ "$C_USED" =~ ^[0-9]+$ ]] && A1_CORES_USED=$(( A1_CORES_USED + C_USED ))
+    [[ "$R_USED" =~ ^[0-9]+$ ]] && A1_RAM_USED=$(( A1_RAM_USED + R_USED ))
+    if [[ "$C_FREE" =~ ^[0-9]+$ ]] && [[ "$R_FREE" =~ ^[0-9]+$ ]]; then
+        QUOTA_OK=true
+        [ "$C_FREE" -gt "$A1_CORES_FREE" ] && A1_CORES_FREE=$C_FREE
+        [ "$R_FREE" -gt "$A1_RAM_FREE" ] && A1_RAM_FREE=$R_FREE
+    fi
+done
 
-A1_CORES_FREE=$(get_limit_available "standard-a1-core-count")
-A1_RAM_FREE=$(get_limit_available "standard-a1-memory-count")
-A1_CORES_USED=$(get_limit_used "standard-a1-core-count")
-A1_RAM_USED=$(get_limit_used "standard-a1-memory-count")
-[[ "$A1_CORES_USED" =~ ^[0-9]+$ ]] || A1_CORES_USED=0
-[[ "$A1_RAM_USED" =~ ^[0-9]+$ ]] || A1_RAM_USED=0
-
-if [[ "$A1_CORES_FREE" =~ ^[0-9]+$ ]] && [[ "$A1_RAM_FREE" =~ ^[0-9]+$ ]]; then
-    QUOTA_OK=true
+if [ "$QUOTA_OK" = true ]; then
     echo -e "  > Cota A1 livre:   ${GREEN}${A1_CORES_FREE} OCPU / ${A1_RAM_FREE}GB RAM${NC}"
 else
-    QUOTA_OK=false
     echo -e "  > Cota A1 livre:   ${YELLOW}indeterminada (opção 6 indisponível)${NC}"
 fi
 
@@ -158,14 +172,64 @@ AF_MAX_RAM=24                    # Always Free: 24GB RAM total, all instances
 AF_MAX_STORAGE=200               # Always Free: 200GB block storage total
 AF_VPU=10                        # Balanced performance; higher tiers are paid
 
+# --- CAPACITY HUNT TUNING (override via ambiente) ---
+# A1 capacity opens in unpredictable, short windows: the hunt is a time budget,
+# not a fixed number of tries. Probing uses the capacity report API, which has
+# no side effect and a far looser rate limit than launch_instance.
+HUNT_MINUTES=${HUNT_MINUTES:-180}                    # janela total por instância
+POLL_SECONDS=${POLL_SECONDS:-30}                     # intervalo entre sondagens
+BLIND_POLL_SECONDS=${BLIND_POLL_SECONDS:-60}         # intervalo sem capacity report
+MAX_RATE_RETRIES=${MAX_RATE_RETRIES:-6}              # 429 CONSECUTIVOS tolerados
+BOOT_TIMEOUT_SECONDS=${BOOT_TIMEOUT_SECONDS:-900}    # teto para chegar em RUNNING
+
 # --- ALWAYS FREE COMPLIANCE CHECK (Storage) ---
-USED_STORAGE=$(oci bv boot-volume list --availability-domain "$AD_NAME" --compartment-id "$TENANCY_ID" --output json 2>/dev/null | jq '[.data[] | select(."lifecycle-state" != "TERMINATED") | ."size-in-gbs"] | add')
-[ -z "$USED_STORAGE" ] || [ "$USED_STORAGE" == "null" ] && USED_STORAGE=0
-FREE_STORAGE=$((200 - USED_STORAGE))
+# The 200GB allotment covers BOOT *and* BLOCK volumes, in every AD -- counting
+# only boot volumes of AD[0] underestimates usage and can push past the ceiling.
+sum_volumes() {
+    # $1 = subcomando bv (boot-volume|volume), $2 = AD
+    oci bv "$1" list --availability-domain "$2" --compartment-id "$TENANCY_ID" --output json 2>/dev/null \
+        | jq '[.data[]? | select(."lifecycle-state" != "TERMINATED") | ."size-in-gbs"] | add // 0'
+}
+
+USED_STORAGE=0
+for AD in "${AD_LIST[@]}"; do
+    for KIND in boot-volume volume; do
+        SZ=$(sum_volumes "$KIND" "$AD")
+        [[ "$SZ" =~ ^[0-9]+$ ]] && USED_STORAGE=$(( USED_STORAGE + SZ ))
+    done
+done
+FREE_STORAGE=$(( AF_MAX_STORAGE - USED_STORAGE ))
 
 if [ "$FREE_STORAGE" -lt 50 ]; then
      echo -e "${RED}[!] CRÍTICO: Armazenamento Always Free insuficiente (Disponível: ${FREE_STORAGE}GB).${NC}"
      exit 1
+fi
+
+# --- INGRESS PRE-FLIGHT ---
+# harden.sh libera 22/80/443 no ufw, mas a security list da VCN filtra antes:
+# sem ingress na 22 o pós-deploy trava esperando um SSH que nunca conecta.
+INGRESS_JSON=$(oci network security-list list --compartment-id "$TENANCY_ID" --output json 2>/dev/null)
+port_open() {
+    echo "$INGRESS_JSON" | jq -e --argjson p "$1" '
+        [ .data[]?."ingress-security-rules"[]?
+          | select(.source == "0.0.0.0/0")
+          | select(.protocol == "all" or .protocol == "6")
+          | select( (."tcp-options" == null)
+                    or (."tcp-options"."destination-port-range" == null)
+                    or ( (."tcp-options"."destination-port-range".min <= $p)
+                         and (."tcp-options"."destination-port-range".max >= $p) ) )
+        ] | length > 0' >/dev/null 2>&1
+}
+MISSING_PORTS=()
+for P in 22 80 443; do port_open "$P" || MISSING_PORTS+=("$P"); done
+if [ ${#MISSING_PORTS[@]} -gt 0 ]; then
+    echo -e "${YELLOW}[!] AVISO: a security list da VCN não tem ingress 0.0.0.0/0 para: ${MISSING_PORTS[*]}${NC}"
+    if printf '%s\n' "${MISSING_PORTS[@]}" | grep -qx 22; then
+        echo -e "${RED}    Sem a porta 22 o pós-deploy vai travar aguardando SSH.${NC}"
+        echo -e "${YELLOW}    Console > Networking > VCN > Security Lists > Add Ingress Rule.${NC}"
+    else
+        echo -e "${YELLOW}    O hardening abre essas portas no ufw, mas a VCN bloqueia antes.${NC}"
+    fi
 fi
 
 echo -e "${YELLOW}Selecione a Estratégia de Implantação:${NC}"
@@ -235,6 +299,77 @@ check_free_tier_budget() {
     fi
 }
 
+# Cheap, side-effect-free capacity probe (CreateComputeCapacityReport).
+# Echoes AVAILABLE / OUT_OF_HOST_CAPACITY / HARDWARE_NOT_SUPPORTED, or nothing
+# when the API is not reachable for this user (older CLI, missing IAM policy).
+capacity_status() {
+    local AD=$1 OCPU=$2 RAM=$3
+    oci compute compute-capacity-report create \
+        --compartment-id "$TENANCY_ID" \
+        --availability-domain "$AD" \
+        --shape-availabilities "[{\"instanceShape\":\"$AF_SHAPE\",\"instanceShapeConfig\":{\"ocpus\":$OCPU,\"memoryInGBs\":$RAM}}]" \
+        --output json 2>/dev/null \
+        | jq -r '.data."shape-availabilities"[0]."availability-status" // empty'
+}
+
+# Waits for a freshly launched instance to become usable and records it.
+# Every wait here is bounded: a provision that fails or stalls must surface as
+# an error, never hang the script.
+finalize_instance() {
+    local NAME=$1 AD=$2 RES=$3
+    local INSTANCE_ID
+    INSTANCE_ID=$(echo "$RES" | jq -r '.data.id // empty' 2>/dev/null)
+    if [ -z "$INSTANCE_ID" ]; then
+        echo -e "${RED}[!] Launch de $NAME retornou sem OCID. Resposta:\n$RES${NC}"
+        return 1
+    fi
+
+    echo -ne "${CYAN}[*] Aguardando a instância $NAME inicializar... ${NC}"
+    local WAIT_DEADLINE=$(( $(date +%s) + BOOT_TIMEOUT_SECONDS ))
+    local STATE=""
+    while true; do
+        STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --output json 2>/dev/null | jq -r '.data."lifecycle-state" // empty')
+        case "$STATE" in
+            RUNNING)
+                echo -e "${GREEN}EXECUTANDO ($NAME)!${NC}"
+                break
+                ;;
+            TERMINATED|TERMINATING|STOPPED|STOPPING)
+                echo -e "\n${RED}[!] $NAME entrou em ${STATE} antes de ficar pronta.${NC}"
+                echo -e "${YELLOW}    OCID: $INSTANCE_ID${NC}"
+                return 1
+                ;;
+        esac
+        if [ "$(date +%s)" -ge "$WAIT_DEADLINE" ]; then
+            echo -e "\n${RED}[!] Timeout: $NAME não chegou em RUNNING em ${BOOT_TIMEOUT_SECONDS}s (estado: ${STATE:-desconhecido}).${NC}"
+            echo -e "${YELLOW}    Verifique no console: $INSTANCE_ID${NC}"
+            return 1
+        fi
+        sleep 5
+    done
+
+    # A VNIC pode demorar alguns segundos para aparecer depois do RUNNING.
+    local PUBLIC_IP=""
+    local IP_DEADLINE=$(( $(date +%s) + 120 ))
+    while true; do
+        PUBLIC_IP=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --output json 2>/dev/null | jq -r '.data[0]."public-ip" // empty')
+        [ -n "$PUBLIC_IP" ] && break
+        [ "$(date +%s)" -ge "$IP_DEADLINE" ] && break
+        sleep 5
+    done
+    if [ -z "$PUBLIC_IP" ]; then
+        echo -e "${RED}[!] $NAME está RUNNING mas sem IP público. OCID: $INSTANCE_ID${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}[+] CAPACIDADE GARANTIDA ($NAME em $AD)! IP: $PUBLIC_IP${NC}"
+    echo "$(date) | $NAME | IP: $PUBLIC_IP | AD: $AD | ID: $INSTANCE_ID" >> "$LOG_FILE"
+
+    # Adds the created machine to the temp file (thread-safe for parallel launches)
+    echo "$NAME|$PUBLIC_IP" >> "$TEMP_MACHINES_FILE"
+    return 0
+}
+
 launch_vps() {
     local NAME=$1
     local OCPU=$2
@@ -262,80 +397,118 @@ launch_vps() {
     fi
 
     local START_TIME=$(date +%s)
-    local RETRY_COUNT=0
-    local MAX_RETRIES=20  # 20 tentativas × 60s = ~20 minutos
-    local RATE_COUNT=0
-    local MAX_RATE_RETRIES=6  # backoff exponencial: 60s..600s (~35 min)
+    local DEADLINE=$(( START_TIME + HUNT_MINUTES * 60 ))
+    local RATE_COUNT=0        # 429 CONSECUTIVOS, zerado a cada resposta normal
+    local PROBES=0
+    local ATTEMPTS=0
+    local REPORT_OK=true      # cai para false se o capacity report não responder
+    local LAUNCH_RES ST BACKOFF ELAPSED
+    local TARGET_ADS=()
+
+    echo -e "\n${YELLOW}[...] Caçando capacidade: $NAME ($OCPU OCPU / ${RAM}GB RAM${BOOT_DESC})${NC}"
+    echo -e "${CYAN}      Janela ${HUNT_MINUTES}min | sondagem ${POLL_SECONDS}s | ${#AD_LIST[@]} AD(s)${NC}"
 
     while true; do
-        echo -e "\n${YELLOW}[...] Buscando capacidade: $NAME ($OCPU OCPU / ${RAM}GB RAM${BOOT_DESC})${NC}"
-
-        LAUNCH_RES=$(oci compute instance launch \
-            --availability-domain "$AD_NAME" \
-            --compartment-id "$TENANCY_ID" \
-            --shape "$AF_SHAPE" \
-            --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $RAM}" \
-            --source-details "$SRC_DETAILS" \
-            --display-name "$NAME" \
-            --subnet-id "$SUBNET_ID" \
-            --assign-public-ip true \
-            --user-data-file "$USERDATA" \
-            --ssh-authorized-keys-file "$SSH_PUB_KEY" 2>&1)
-
-        if [[ $LAUNCH_RES == *"Out of capacity"* || $LAUNCH_RES == *"Out of host capacity"* ]]; then
-            RETRY_COUNT=$(( RETRY_COUNT + 1 ))
+        if [ "$(date +%s)" -ge "$DEADLINE" ]; then
             ELAPSED=$(( $(date +%s) - START_TIME ))
-            if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
-                echo -e "\n${RED}[!] Limite de tentativas atingido para '$NAME' após ${ELAPSED}s.${NC}"
-                echo -e "${YELLOW}    A região ${AD_NAME%%-AD-*} está com alta demanda no momento.${NC}"
-                echo -e "${YELLOW}    Sugestão: tente novamente em horários de menor tráfego,${NC}"
-                echo -e "${YELLOW}    como madrugada ou início da manhã (horário UTC).${NC}"
-                echo -e "${YELLOW}    Considere também tentar uma estratégia com menor alocação de recursos.${NC}"
-                break
-            fi
-            echo -e "${RED}[-] Sem capacidade para $NAME. Tentativa $RETRY_COUNT/$MAX_RETRIES — nova tentativa em 60s...${NC}"
-            sleep 60
-        elif [[ $LAUNCH_RES == *"TooManyRequests"* ]]; then
-            # HTTP 429: the launch_instance API is rate limited per user and
-            # needs exponential backoff, not the flat retry used for capacity.
-            RATE_COUNT=$(( RATE_COUNT + 1 ))
-            if [ "$RATE_COUNT" -ge "$MAX_RATE_RETRIES" ]; then
-                echo -e "\n${RED}[!] Rate limit persistente da API para '$NAME'.${NC}"
-                echo -e "${YELLOW}    A OCI limita chamadas de launch_instance por usuário.${NC}"
-                echo -e "${YELLOW}    Aguarde ~15 minutos sem novas tentativas e execute novamente.${NC}"
-                break
-            fi
-            BACKOFF=$(( 60 * (2 ** (RATE_COUNT - 1)) ))
-            [ "$BACKOFF" -gt 600 ] && BACKOFF=600
-            echo -e "${YELLOW}[-] Rate limit da API (429). Tentativa $RATE_COUNT/$MAX_RATE_RETRIES — aguardando ${BACKOFF}s...${NC}"
-            sleep "$BACKOFF"
-        elif [[ $LAUNCH_RES == *"LimitExceeded"* ]]; then
-            echo -e "${RED}[!] Cota excedida para '$NAME' ($OCPU OCPU / ${RAM}GB RAM).${NC}"
-            echo -e "${YELLOW}    Sua cota A1 livre é de ${A1_CORES_FREE:-?} OCPU / ${A1_RAM_FREE:-?}GB RAM.${NC}"
-            echo -e "${YELLOW}    Use a opção 6 (Limited Full Power) para caber automaticamente,${NC}"
-            echo -e "${YELLOW}    ou peça aumento em: Console > Limits, Quotas and Usage.${NC}"
-            break
-        elif [[ $LAUNCH_RES == *"Error"* || $LAUNCH_RES == *"ServiceError"* || $LAUNCH_RES == *"Usage:"* ]]; then
-            echo -e "${RED}[!] Comando OCI falhou para $NAME! Detalhes:\n$LAUNCH_RES${NC}"
-            break
-        else
-            INSTANCE_ID=$(echo "$LAUNCH_RES" | jq -r '.data.id' 2>/dev/null)
-            echo -ne "${CYAN}[*] Aguardando a instância $NAME inicializar... ${NC}"
-            
-            while true; do
-                STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --output json 2>/dev/null | jq -r '.data."lifecycle-state"')
-                if [ "$STATE" == "RUNNING" ]; then echo -e "${GREEN}EXECUTANDO ($NAME)!${NC}"; break; fi
-                sleep 5
-            done
+            echo -e "\n${RED}[!] Janela de ${HUNT_MINUTES}min esgotada para '$NAME' (${ELAPSED}s, ${PROBES} sondagens, ${ATTEMPTS} launches).${NC}"
+            echo -e "${YELLOW}    A demanda por A1 nesta região está alta no momento.${NC}"
+            echo -e "${YELLOW}    Amplie a janela: HUNT_MINUTES=480 ./oci_provision.sh${NC}"
+            echo -e "${YELLOW}    Considere também uma estratégia com menor alocação de recursos.${NC}"
+            return 1
+        fi
 
-            PUBLIC_IP=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --output json 2>/dev/null | jq -r '.data[0]."public-ip"')
-            
-            echo -e "${GREEN}[+] CAPACIDADE GARANTIDA ($NAME)! IP: $PUBLIC_IP${NC}"
-            echo "$(date) | $NAME | IP: $PUBLIC_IP | ID: $INSTANCE_ID" >> "$LOG_FILE"
-            
-            # Adds the created machine to the temp file (thread-safe for parallel launches)
-            echo "$NAME|$PUBLIC_IP" >> "$TEMP_MACHINES_FILE"
-            break
+        # 1. Descobre onde há capacidade SEM efeito colateral. Só o resultado
+        #    positivo justifica gastar uma chamada de launch_instance (429).
+        TARGET_ADS=()
+        if [ "$REPORT_OK" = true ]; then
+            PROBES=$(( PROBES + 1 ))
+            for AD in "${AD_LIST[@]}"; do
+                ST=$(capacity_status "$AD" "$OCPU" "$RAM")
+                if [ -z "$ST" ]; then
+                    echo -e "${YELLOW}[!] Capacity report indisponível — caindo para sondagem direta.${NC}"
+                    REPORT_OK=false
+                    break
+                fi
+                [ "$ST" == "AVAILABLE" ] && TARGET_ADS+=("$AD")
+            done
+        fi
+        if [ "$REPORT_OK" = false ]; then
+            TARGET_ADS=("${AD_LIST[@]}")
+        fi
+
+        # 2. Nada disponível: espera e sonda de novo (log resumido a cada ~10).
+        if [ ${#TARGET_ADS[@]} -eq 0 ]; then
+            if [ $(( PROBES % 10 )) -eq 1 ]; then
+                echo -e "${RED}[-] Sem capacidade para $NAME — sondagem ${PROBES}, $(( ($(date +%s) - START_TIME) / 60 ))/${HUNT_MINUTES}min decorridos.${NC}"
+            fi
+            sleep $(( POLL_SECONDS + RANDOM % 10 ))
+            continue
+        fi
+
+        # 3. Há capacidade: dispara o launch de verdade.
+        for AD in "${TARGET_ADS[@]}"; do
+            ATTEMPTS=$(( ATTEMPTS + 1 ))
+            [ "$REPORT_OK" = true ] && echo -e "${GREEN}[>] Capacidade detectada em $AD — lançando $NAME (launch #${ATTEMPTS})...${NC}"
+
+            LAUNCH_RES=$(oci compute instance launch \
+                --availability-domain "$AD" \
+                --compartment-id "$TENANCY_ID" \
+                --shape "$AF_SHAPE" \
+                --shape-config "{\"ocpus\": $OCPU, \"memoryInGBs\": $RAM}" \
+                --source-details "$SRC_DETAILS" \
+                --display-name "$NAME" \
+                --subnet-id "$SUBNET_ID" \
+                --assign-public-ip true \
+                --user-data-file "$USERDATA" \
+                --ssh-authorized-keys-file "$SSH_PUB_KEY" 2>&1)
+
+            if [[ $LAUNCH_RES == *"Out of capacity"* || $LAUNCH_RES == *"Out of host capacity"* ]]; then
+                RATE_COUNT=0
+                if [ "$REPORT_OK" = true ]; then
+                    echo -e "${RED}[-] A capacidade em $AD sumiu antes do launch. Continuando a caça...${NC}"
+                elif [ $(( ATTEMPTS % 10 )) -eq 1 ]; then
+                    echo -e "${RED}[-] Sem capacidade para $NAME — tentativa ${ATTEMPTS}, $(( ($(date +%s) - START_TIME) / 60 ))/${HUNT_MINUTES}min decorridos.${NC}"
+                fi
+                continue
+            elif [[ $LAUNCH_RES == *"TooManyRequests"* ]]; then
+                # HTTP 429: launch_instance é limitada por usuário e exige
+                # backoff exponencial. Só 429 CONSECUTIVOS abortam a caça.
+                RATE_COUNT=$(( RATE_COUNT + 1 ))
+                if [ "$RATE_COUNT" -ge "$MAX_RATE_RETRIES" ]; then
+                    echo -e "\n${RED}[!] ${MAX_RATE_RETRIES} rate limits consecutivos para '$NAME'.${NC}"
+                    echo -e "${YELLOW}    A OCI limita chamadas de launch_instance por usuário.${NC}"
+                    echo -e "${YELLOW}    Aguarde ~15 minutos sem novas tentativas e execute novamente.${NC}"
+                    return 1
+                fi
+                BACKOFF=$(( 60 * (2 ** (RATE_COUNT - 1)) ))
+                [ "$BACKOFF" -gt 600 ] && BACKOFF=600
+                echo -e "${YELLOW}[-] Rate limit da API (429) — ${RATE_COUNT}/${MAX_RATE_RETRIES} consecutivos, aguardando ${BACKOFF}s...${NC}"
+                sleep "$BACKOFF"
+                continue
+            elif [[ $LAUNCH_RES == *"LimitExceeded"* ]]; then
+                echo -e "${RED}[!] Cota excedida para '$NAME' ($OCPU OCPU / ${RAM}GB RAM).${NC}"
+                echo -e "${YELLOW}    Sua cota A1 livre é de ${A1_CORES_FREE:-?} OCPU / ${A1_RAM_FREE:-?}GB RAM.${NC}"
+                echo -e "${YELLOW}    Use a opção 6 (Limited Full Power) para caber automaticamente,${NC}"
+                echo -e "${YELLOW}    ou peça aumento em: Console > Limits, Quotas and Usage.${NC}"
+                return 1
+            elif [[ $LAUNCH_RES == *"Error"* || $LAUNCH_RES == *"ServiceError"* || $LAUNCH_RES == *"Usage:"* ]]; then
+                echo -e "${RED}[!] Comando OCI falhou para $NAME! Detalhes:\n$LAUNCH_RES${NC}"
+                return 1
+            fi
+
+            RATE_COUNT=0
+            finalize_instance "$NAME" "$AD" "$LAUNCH_RES"
+            return $?
+        done
+
+        # Nenhum launch desta rodada vingou (corrida perdida ou 429): sempre
+        # espera antes da próxima, senão a caça vira uma rajada de chamadas
+        # de launch_instance -- exatamente o que dispara o rate limit.
+        if [ "$REPORT_OK" = true ]; then
+            sleep "$POLL_SECONDS"
+        else
+            sleep "$BLIND_POLL_SECONDS"
         fi
     done
 }

@@ -121,6 +121,32 @@ chmod +x *.sh
 
 O orquestrador guia interativamente pelo provisionamento. Ao final, exibe o comando SSH de acesso a cada instância criada.
 
+### Ajuste da caça por capacidade
+
+A capacidade A1 abre em janelas curtas e imprevisíveis, então o provisionamento trabalha com **orçamento de tempo**, não com número fixo de tentativas. A sondagem usa a API `CreateComputeCapacityReport` — sem efeito colateral e com rate limit muito mais folgado que `launch_instance` — e só dispara um launch de verdade quando o relatório aponta `AVAILABLE`, em qualquer AD da região.
+
+| Variável | Padrão | O que faz |
+|---|---|---|
+| `HUNT_MINUTES` | `180` | Janela total de caça por instância |
+| `POLL_SECONDS` | `30` | Intervalo entre sondagens de capacidade |
+| `BLIND_POLL_SECONDS` | `60` | Intervalo quando o capacity report não está disponível |
+| `MAX_RATE_RETRIES` | `6` | Respostas 429 **consecutivas** toleradas |
+| `BOOT_TIMEOUT_SECONDS` | `900` | Teto de espera até a instância ficar `RUNNING` |
+
+```bash
+# caça de 8 horas, sondando a cada 20s
+HUNT_MINUTES=480 POLL_SECONDS=20 ./oci_provision.sh
+```
+
+Para conferir a capacidade manualmente, sem provisionar nada:
+
+```bash
+oci compute compute-capacity-report create \
+  --compartment-id <tenancy-ocid> \
+  --availability-domain <seu-AD> \
+  --shape-availabilities '[{"instanceShape":"VM.Standard.A1.Flex","instanceShapeConfig":{"ocpus":2.0,"memoryInGBs":12.0}}]'
+```
+
 ### Utilitários independentes
 
 ```bash
@@ -166,13 +192,15 @@ Para tentar elevar o limite: Console → *Governance & Administration* → *Limi
 "message": "Too many requests for the user"
 ```
 
-Rate limit da API. A OCI limita chamadas de `launch_instance` por usuário, e tentativas seguidas — inclusive as que falharam por outros motivos — contam para o limite. O `launch_vps()` trata esse caso com **backoff exponencial** (60s → 120s → 240s → 480s → 600s, até 6 tentativas), separado do retry de capacidade, que usa intervalo fixo.
+Rate limit da API. A OCI limita chamadas de `launch_instance` por usuário, e tentativas seguidas — inclusive as que falharam por outros motivos — contam para o limite. Por isso a caça sonda com o capacity report e só gasta uma chamada de `launch_instance` quando há capacidade de fato; na prática o 429 deixa de aparecer.
+
+Quando ele ainda ocorre, o `launch_vps()` aplica **backoff exponencial** (60s → 120s → 240s → 480s → 600s). O corte é por 429 **consecutivos** (`MAX_RATE_RETRIES`, padrão 6): qualquer resposta normal zera o contador, então uma caça longa não morre por 429 acumulados ao longo de horas.
 
 Se o limite persistir depois disso, aguarde ~15 minutos **sem novas tentativas** antes de executar de novo — cada tentativa durante o bloqueio renova a contagem.
 
 ### `Out of host capacity`
 
-Não há hardware A1 livre na região no momento — situação diferente de cota. O `launch_vps()` já faz retry automático (20 tentativas × 60s). Horários de menor demanda, como a madrugada UTC, aumentam a chance de sucesso.
+Não há hardware A1 livre na região no momento — situação diferente de cota. A caça continua sondando todas as ADs da região dentro da janela de `HUNT_MINUTES` (padrão 3h) e lança assim que aparecer hardware. Horários de menor demanda, como a madrugada UTC, aumentam a chance de sucesso; em regiões cronicamente saturadas vale rodar com `HUNT_MINUTES=480` ou mais.
 
 ### Shape indisponível na região
 
